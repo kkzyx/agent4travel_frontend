@@ -25,6 +25,8 @@ const exportLoading = ref('')
 const amapStatus = ref('idle')
 const amapMessage = ref('')
 const mapContainer = ref(null)
+const itineraryFilter = ref('all')
+const collapsedDays = ref({})
 
 let mapInstance = null
 let AMapRef = null
@@ -68,6 +70,40 @@ const totalStops = computed(() => {
 })
 
 const hasAmapKey = computed(() => Boolean(AMAP_KEY))
+const isOverviewMode = computed(() => itineraryFilter.value === 'all')
+const visibleDays = computed(() => {
+  if (!plan.value) return []
+  if (itineraryFilter.value === 'all') return plan.value.days
+  return plan.value.days.filter((day) => day.day === itineraryFilter.value)
+})
+const visibleRouteDays = computed(() => {
+  if (!plan.value) return []
+  if (itineraryFilter.value === 'all') return plan.value.days.map((day) => day.day)
+  return [itineraryFilter.value]
+})
+
+function initializeCollapsedDays() {
+  if (!plan.value?.days?.length) return
+  const nextState = {}
+  plan.value.days.forEach((day) => {
+    nextState[day.day] = false
+  })
+  collapsedDays.value = nextState
+}
+
+function setItineraryFilter(value) {
+  itineraryFilter.value = value
+  if (plan.value && mapInstance && AMapRef) {
+    resolvePoisAndRoutes()
+  }
+}
+
+function toggleDayCollapse(dayNumber) {
+  collapsedDays.value = {
+    ...collapsedDays.value,
+    [dayNumber]: !collapsedDays.value[dayNumber]
+  }
+}
 
 function toMinutes(text) {
   if (!text || text.includes('次日')) return null
@@ -115,6 +151,7 @@ async function generatePlan() {
     })
     plan.value = await response.json()
     normalizePlan()
+    initializeCollapsedDays()
   } finally {
     loading.value = false
   }
@@ -135,6 +172,7 @@ async function syncPlan() {
     })
     plan.value = await response.json()
     normalizePlan()
+    if (!Object.keys(collapsedDays.value).length) initializeCollapsedDays()
   } finally {
     savingPlan.value = false
   }
@@ -154,6 +192,7 @@ async function updatePlan(payload) {
     })
     plan.value = await response.json()
     normalizePlan()
+    if (!Object.keys(collapsedDays.value).length) initializeCollapsedDays()
   } finally {
     savingPlan.value = false
   }
@@ -481,8 +520,9 @@ async function resolvePoisAndRoutes() {
   clearAmapOverlays()
 
   try {
+    const selectedDays = plan.value.days.filter((day) => visibleRouteDays.value.includes(day.day))
     const allDayPois = await Promise.all(
-      plan.value.days.map(async (day) => {
+      selectedDays.map(async (day) => {
         const sights = day.items.filter((item) => item.type === 'sight')
         const pois = []
         for (const item of sights) {
@@ -578,10 +618,23 @@ watch(
   async () => {
     await nextTick()
     if (plan.value) {
+      if (!Object.keys(collapsedDays.value).length || plan.value.days.some((day) => !(day.day in collapsedDays.value))) {
+        initializeCollapsedDays()
+      }
       setupMap()
     }
   },
   { deep: true }
+)
+
+watch(
+  () => itineraryFilter.value,
+  async () => {
+    await nextTick()
+    if (plan.value && mapInstance && AMapRef) {
+      resolvePoisAndRoutes()
+    }
+  }
 )
 
 onMounted(async () => {
@@ -727,10 +780,27 @@ onBeforeUnmount(() => {
             <div class="map-header">
               <div>
                 <h3>路线可视化</h3>
-                <p>基于高德真实景点搜索、官方路径规划和标签避让。</p>
+                <p>{{ isOverviewMode ? '基于高德真实景点搜索、官方路径规划和标签避让。' : `当前仅展示 Day ${itineraryFilter} 的路线。` }}</p>
               </div>
               <div class="map-legend" v-if="plan.days.length">
-                <span v-for="day in plan.days" :key="day.day">Day {{ day.day }}</span>
+                <button
+                  type="button"
+                  class="map-filter-btn"
+                  :class="{ active: itineraryFilter === 'all' }"
+                  @click="setItineraryFilter('all')"
+                >
+                  全部
+                </button>
+                <button
+                  v-for="day in plan.days"
+                  :key="`map-filter-${day.day}`"
+                  type="button"
+                  class="map-filter-btn"
+                  :class="{ active: itineraryFilter === day.day }"
+                  @click="setItineraryFilter(day.day)"
+                >
+                  Day {{ day.day }}
+                </button>
               </div>
             </div>
             <div v-if="amapStatus === 'missing-key'" class="map-empty">
@@ -764,25 +834,63 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
+          <div class="day-switcher">
+            <button
+              type="button"
+              class="day-pill"
+              :class="{ active: itineraryFilter === 'all' }"
+              @click="setItineraryFilter('all')"
+            >
+              <span>全部</span>
+              <small>{{ plan.days.length }} 天总览</small>
+            </button>
+            <button
+              v-for="day in plan.days"
+              :key="`switch-${day.day}`"
+              type="button"
+              class="day-pill"
+              :class="{ active: itineraryFilter === day.day }"
+              @click="setItineraryFilter(day.day)"
+            >
+              <span>Day {{ day.day }}</span>
+              <small>{{ day.items.filter((item) => item.type === 'sight').length }} 个景点</small>
+            </button>
+          </div>
+
           <div class="days-grid">
             <article
               class="day-card"
-              v-for="day in plan.days"
+              :class="{ 'day-card--single': !isOverviewMode }"
+              v-for="day in visibleDays"
               :key="day.day"
               @dragover.prevent
               @drop.prevent="onDropDayEnd(day)"
             >
               <div class="day-head">
-                <h4>{{ day.theme }}</h4>
-                <span class="drag-tip">拖拽卡片可调整顺序</span>
+                <div>
+                  <h4>{{ day.theme }}</h4>
+                  <span class="drag-tip">拖拽卡片可调整顺序</span>
+                </div>
+                <div class="day-head-actions">
+                  <span class="day-count">{{ day.items.filter((item) => item.type === 'sight').length }} 个景点</span>
+                  <button
+                    v-if="isOverviewMode"
+                    type="button"
+                    class="collapse-btn"
+                    @click="toggleDayCollapse(day.day)"
+                  >
+                    {{ collapsedDays[day.day] ? '展开' : '折叠' }}
+                  </button>
+                </div>
               </div>
 
-              <div class="timeline">
+              <div v-if="!collapsedDays[day.day]" class="timeline" :class="{ 'timeline--single': !isOverviewMode }">
                 <div class="drop-slot" @dragover.prevent @drop.prevent="onDropItem(day, 0)">
                   放到最前
                 </div>
                 <div
                   class="timeline-item"
+                  :class="{ 'timeline-item--single': !isOverviewMode }"
                   v-for="(item, itemIndex) in day.items"
                   :key="item.id"
                   draggable="true"
@@ -833,12 +941,16 @@ onBeforeUnmount(() => {
                 </div>
               </div>
 
-              <div class="custom-form">
+              <div v-if="!collapsedDays[day.day]" class="custom-form">
                 <input v-model="newAttraction.name" placeholder="添加自定义景点" />
                 <textarea v-model="newAttraction.description" rows="2" placeholder="景点描述"></textarea>
                 <button class="secondary-btn" type="button" @click="addCustomAttraction(day.day)">
                   添加到第 {{ day.day }} 天
                 </button>
+              </div>
+              <div v-if="collapsedDays[day.day]" class="collapsed-summary">
+                <span>{{ day.items.length }} 个行程块</span>
+                <span>{{ day.items.filter((item) => item.type === 'sight').map((item) => item.title).slice(0, 3).join(' / ') }}</span>
               </div>
             </article>
           </div>
